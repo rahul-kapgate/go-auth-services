@@ -4,66 +4,127 @@ import (
 	"errors"
 	"log"
 	"net/http"
-
-	"github.com/gin-gonic/gin"
+	"strings"
+	"time"
 
 	"auth-service/internal/repository"
 	"auth-service/internal/service"
+
+	"github.com/gin-gonic/gin"
 )
 
+const refreshCookiePath = "/api/v1/auth"
+
 type AuthHandler struct {
-	service *service.AuthService
+	authService       *service.AuthService
+	refreshCookieName string
+	cookieSecure      bool
+	cookieSameSite    http.SameSite
+	refreshTTL        time.Duration
 }
 
-func NewAuthHandler(authService *service.AuthService) *AuthHandler {
-	return &AuthHandler{
-		service: authService,
+// NewAuthHandler initializes the authentication HTTP handler.
+func NewAuthHandler(
+	authService *service.AuthService,
+	cookieName string,
+	cookieSecure bool,
+	cookieSameSite string,
+	refreshTTL time.Duration,
+) (*AuthHandler, error) {
+
+	if authService == nil {
+		return nil, errors.New("auth service is required")
 	}
+
+	if refreshTTL <= 0 {
+		return nil, errors.New("refresh token TTL must be positive")
+	}
+
+	cookieName = strings.TrimSpace(cookieName)
+	if cookieName == "" {
+		cookieName = "refresh_token"
+	}
+
+	var sameSite http.SameSite
+
+	switch strings.ToLower(strings.TrimSpace(cookieSameSite)) {
+	case "", "lax":
+		sameSite = http.SameSiteLaxMode
+
+	case "strict":
+		sameSite = http.SameSiteStrictMode
+
+	case "none":
+		if !cookieSecure {
+			return nil, errors.New(
+				"COOKIE_SECURE must be true when COOKIE_SAME_SITE is none",
+			)
+		}
+
+		sameSite = http.SameSiteNoneMode
+
+	default:
+		return nil, errors.New("invalid COOKIE_SAME_SITE value")
+	}
+
+	return &AuthHandler{
+		authService:       authService,
+		refreshCookieName: cookieName,
+		cookieSecure:      cookieSecure,
+		cookieSameSite:    sameSite,
+		refreshTTL:        refreshTTL,
+	}, nil
 }
 
-// Request DTOs
+// =====================================================
+// REQUEST DTOs
+// =====================================================
 
-type SignupRequest struct {
-	Name     string `json:"name" binding:"required"`
-	Email    string `json:"email" binding:"required"`
-	Password string `json:"password" binding:"required"`
+type signupRequest struct {
+	Name     string `json:"name"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
 }
 
-type LoginRequest struct {
-	Email    string `json:"email" binding:"required"`
-	Password string `json:"password" binding:"required"`
+type verifyEmailRequest struct {
+	Email string `json:"email"`
+	OTP   string `json:"otp"`
 }
 
-type VerifyEmailRequest struct {
-	Email string `json:"email" binding:"required"`
-	OTP   string `json:"otp" binding:"required"`
+type resendOTPRequest struct {
+	Email string `json:"email"`
 }
 
-type ResendOTPRequest struct {
-	Email string `json:"email" binding:"required"`
+type loginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
 }
 
-type RefreshRequest struct {
-	RefreshToken string `json:"refresh_token" binding:"required"`
-}
+// =====================================================
+// SIGNUP
+// =====================================================
 
-type LogoutRequest struct {
-	RefreshToken string `json:"refresh_token" binding:"required"`
-}
-
-// Signup
+// Signup godoc
+// @Summary      Register a new user
+// @Description  Creates a user account and sends an email verification OTP.
+// @Tags         Authentication
+// @Accept       json
+// @Produce      json
+// @Param        request body signupRequest true "Signup details"
+// @Success      202 {object} map[string]interface{} "Signup successful"
+// @Failure      400 {object} map[string]interface{} "Invalid request"
+// @Failure      409 {object} map[string]interface{} "Email already registered"
+// @Failure      429 {object} map[string]interface{} "OTP cooldown active"
+// @Router       /signup [post]
 func (h *AuthHandler) Signup(c *gin.Context) {
-	var req SignupRequest
+	var req signupRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "Name, email and password are required",
-		})
+		respondError(c, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	email, err := h.service.Signup(
+	err := h.authService.Signup(
 		c.Request.Context(),
 		req.Name,
 		req.Email,
@@ -71,233 +132,315 @@ func (h *AuthHandler) Signup(c *gin.Context) {
 	)
 
 	if err != nil {
-		h.handleError(c, err)
+		switch {
+		case errors.Is(err, service.ErrInvalidInput):
+			respondError(c, http.StatusBadRequest, "Invalid signup details")
+
+		case errors.Is(err, service.ErrEmailAlreadyExists):
+			respondError(c, http.StatusConflict, "Email is already registered")
+
+		case errors.Is(err, service.ErrAccountPendingVerification):
+			respondError(
+				c,
+				http.StatusConflict,
+				"Account verification is pending. Please request an OTP.",
+			)
+
+		case errors.Is(err, repository.ErrOTPCooldown):
+			respondError(
+				c,
+				http.StatusTooManyRequests,
+				"Please wait before requesting another OTP",
+			)
+
+		default:
+			log.Printf("Signup failed: %v", err)
+			respondError(c, http.StatusInternalServerError, "Unable to complete signup")
+		}
+
 		return
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{
-		"success": true,
-		"message": "Verification OTP sent to your email",
-		"data": gin.H{
-			"email": email,
-		},
+		"status":  "success",
+		"message": "Signup successful. Please check your email for the verification code.",
 	})
 }
 
-// Verify Email
+// =====================================================
+// VERIFY EMAIL
+// =====================================================
+
 func (h *AuthHandler) VerifyEmail(c *gin.Context) {
-	var req VerifyEmailRequest
+	var req verifyEmailRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "Email and OTP are required",
-		})
+		respondError(c, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	result, err := h.service.VerifyEmail(
+	req.OTP = strings.TrimSpace(req.OTP)
+
+	if len(req.OTP) != 6 {
+		respondError(c, http.StatusBadRequest, "OTP must contain six digits")
+		return
+	}
+
+	err := h.authService.VerifyEmail(
 		c.Request.Context(),
 		req.Email,
 		req.OTP,
 	)
 
 	if err != nil {
-		h.handleError(c, err)
+		switch {
+		case errors.Is(err, service.ErrInvalidInput):
+			respondError(c, http.StatusBadRequest, "Invalid email address")
+
+		case errors.Is(err, service.ErrInvalidOTP):
+			respondError(c, http.StatusBadRequest, "Invalid or expired OTP")
+
+		case errors.Is(err, service.ErrEmailAlreadyVerified):
+			respondError(c, http.StatusConflict, "Email is already verified")
+
+		default:
+			log.Printf("Email verification failed: %v", err)
+			respondError(
+				c,
+				http.StatusInternalServerError,
+				"Unable to verify email",
+			)
+		}
+
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "Email verified successfully",
-		"data":    result,
+		"status":  "success",
+		"message": "Email verified successfully. You can now log in.",
 	})
 }
 
-// Resend OTP
+// =====================================================
+// RESEND OTP
+// =====================================================
+
 func (h *AuthHandler) ResendOTP(c *gin.Context) {
-	var req ResendOTPRequest
+	var req resendOTPRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "Email is required",
-		})
+		respondError(c, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	err := h.service.ResendVerification(
+	err := h.authService.ResendOTP(
 		c.Request.Context(),
 		req.Email,
 	)
 
 	if err != nil {
-		h.handleError(c, err)
+		switch {
+		case errors.Is(err, service.ErrInvalidInput):
+			respondError(c, http.StatusBadRequest, "Invalid email address")
+
+		case errors.Is(err, repository.ErrOTPCooldown):
+			respondError(
+				c,
+				http.StatusTooManyRequests,
+				"Please wait before requesting another OTP",
+			)
+
+		default:
+			log.Printf("Resend OTP failed: %v", err)
+			respondError(
+				c,
+				http.StatusInternalServerError,
+				"Unable to process OTP request",
+			)
+		}
+
 		return
 	}
 
+	// Generic response avoids revealing whether an account exists.
 	c.JSON(http.StatusAccepted, gin.H{
-		"success": true,
-		"message": "If the account requires verification, an OTP will be sent",
+		"status":  "success",
+		"message": "If the account requires verification, a verification code will be sent.",
 	})
 }
 
-// Login
+// =====================================================
+// LOGIN
+// =====================================================
+
 func (h *AuthHandler) Login(c *gin.Context) {
-	var req LoginRequest
+	var req loginRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "Email and password are required",
-		})
+		respondError(c, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	result, err := h.service.Login(
+	pair, err := h.authService.Login(
 		c.Request.Context(),
 		req.Email,
 		req.Password,
 	)
 
 	if err != nil {
-		h.handleError(c, err)
+		switch {
+		case errors.Is(err, service.ErrInvalidCredentials):
+			respondError(c, http.StatusUnauthorized, "Invalid email or password")
+
+		case errors.Is(err, service.ErrEmailNotVerified):
+			respondError(c, http.StatusForbidden, "Please verify your email first")
+
+		default:
+			log.Printf("Login failed: %v", err)
+			respondError(c, http.StatusInternalServerError, "Unable to login")
+		}
+
 		return
 	}
 
+	// Refresh token is sent only through an HttpOnly cookie.
+	h.setRefreshCookie(c, pair.RefreshToken)
+
+	// TokenPair has json:"-" on RefreshToken.
 	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "Login successful",
-		"data":    result,
+		"status":       "success",
+		"message":      "Login successful",
+		"access_token": pair.AccessToken,
+		"token_type":   pair.TokenType,
+		"expires_in":   pair.ExpiresIn,
+		"user":         pair.User,
 	})
 }
 
-// Refresh Access Token
+// =====================================================
+// REFRESH TOKEN
+// =====================================================
+
 func (h *AuthHandler) Refresh(c *gin.Context) {
-	var req RefreshRequest
+	cookie, err := c.Request.Cookie(h.refreshCookieName)
 
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "Refresh token is required",
-		})
+	if err != nil || cookie.Value == "" {
+		respondError(c, http.StatusUnauthorized, "Refresh token is missing")
 		return
 	}
 
-	result, err := h.service.Refresh(
+	pair, err := h.authService.Refresh(
 		c.Request.Context(),
-		req.RefreshToken,
+		cookie.Value,
 	)
 
 	if err != nil {
-		h.handleError(c, err)
+		if errors.Is(err, service.ErrRefreshTokenInvalid) ||
+			errors.Is(err, service.ErrRefreshTokenReuse) {
+
+			h.clearRefreshCookie(c)
+
+			respondError(
+				c,
+				http.StatusUnauthorized,
+				"Refresh session is invalid. Please login again.",
+			)
+			return
+		}
+
+		log.Printf("Token refresh failed: %v", err)
+		respondError(
+			c,
+			http.StatusInternalServerError,
+			"Unable to refresh session",
+		)
 		return
 	}
 
+	// Replace old refresh cookie with the rotated token.
+	h.setRefreshCookie(c, pair.RefreshToken)
+
 	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "Token refreshed successfully",
-		"data":    result,
+		"status":       "success",
+		"message":      "Token refreshed successfully",
+		"access_token": pair.AccessToken,
+		"token_type":   pair.TokenType,
+		"expires_in":   pair.ExpiresIn,
+		"user":         pair.User,
 	})
 }
 
-// Logout
+// =====================================================
+// LOGOUT
+// =====================================================
+
 func (h *AuthHandler) Logout(c *gin.Context) {
-	var req LogoutRequest
+	cookie, err := c.Request.Cookie(h.refreshCookieName)
 
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "Refresh token is required",
-		})
-		return
+	if err == nil && cookie.Value != "" {
+		err := h.authService.Logout(
+			c.Request.Context(),
+			cookie.Value,
+		)
+
+		if err != nil {
+			log.Printf("Logout failed: %v", err)
+			respondError(c, http.StatusInternalServerError, "Unable to logout")
+			return
+		}
 	}
 
-	err := h.service.Logout(
-		c.Request.Context(),
-		req.RefreshToken,
-	)
+	h.clearRefreshCookie(c)
 
-	if err != nil {
-		h.handleError(c, err)
-		return
-	}
+	c.Status(http.StatusNoContent)
+}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "Logged out successfully",
+// =====================================================
+// COOKIE HELPERS
+// =====================================================
+
+func (h *AuthHandler) setRefreshCookie(
+	c *gin.Context,
+	token string,
+) {
+	now := time.Now().UTC()
+
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     h.refreshCookieName,
+		Value:    token,
+		Path:     refreshCookiePath,
+		HttpOnly: true,
+		Secure:   h.cookieSecure,
+		SameSite: h.cookieSameSite,
+		Expires:  now.Add(h.refreshTTL),
+		MaxAge:   int(h.refreshTTL.Seconds()),
 	})
 }
 
-// Centralized error handling
-func (h *AuthHandler) handleError(c *gin.Context, err error) {
-	switch {
-	case errors.Is(err, service.ErrInvalidInput):
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "Invalid request details",
-		})
+func (h *AuthHandler) clearRefreshCookie(c *gin.Context) {
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     h.refreshCookieName,
+		Value:    "",
+		Path:     refreshCookiePath,
+		HttpOnly: true,
+		Secure:   h.cookieSecure,
+		SameSite: h.cookieSameSite,
+		Expires:  time.Unix(1, 0).UTC(),
+		MaxAge:   -1,
+	})
+}
 
-	case errors.Is(err, repository.ErrEmailExists):
-		c.JSON(http.StatusConflict, gin.H{
-			"success": false,
-			"message": "Email is already registered",
-		})
+// =====================================================
+// RESPONSE HELPERS
+// =====================================================
 
-	case errors.Is(err, service.ErrInvalidCredentials):
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"success": false,
-			"message": "Invalid email or password",
-		})
-
-	case errors.Is(err, service.ErrEmailNotVerified):
-		c.JSON(http.StatusForbidden, gin.H{
-			"success": false,
-			"message": "Please verify your email before logging in",
-		})
-
-	case errors.Is(err, repository.ErrInvalidEmailOTP):
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "Invalid OTP",
-		})
-
-	case errors.Is(err, repository.ErrEmailVerificationExpired):
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "OTP expired. Please request a new OTP",
-		})
-
-	case errors.Is(err, repository.ErrEmailVerificationLocked):
-		c.JSON(http.StatusTooManyRequests, gin.H{
-			"success": false,
-			"message": "Maximum OTP attempts exceeded. Request a new OTP",
-		})
-
-	case errors.Is(err, repository.ErrEmailAlreadyVerified):
-		c.JSON(http.StatusConflict, gin.H{
-			"success": false,
-			"message": "Email is already verified",
-		})
-
-	case errors.Is(err, repository.ErrInvalidRefreshToken):
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"success": false,
-			"message": "Invalid or expired refresh token",
-		})
-
-	case errors.Is(err, service.ErrEmailDelivery):
-		c.JSON(http.StatusBadGateway, gin.H{
-			"success": false,
-			"message": "Unable to send verification email. Please try again later",
-		})
-
-	default:
-		log.Printf("Authentication error: %v", err)
-
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "Something went wrong",
-		})
-	}
+func respondError(
+	c *gin.Context,
+	statusCode int,
+	message string,
+) {
+	c.JSON(statusCode, gin.H{
+		"status":  "error",
+		"message": message,
+	})
 }

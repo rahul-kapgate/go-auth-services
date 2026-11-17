@@ -6,25 +6,41 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// HashPassword converts a plain-text password into a bcrypt hash.
+var (
+	ErrPasswordTooShort = errors.New("password must be at least 8 bytes")
+	ErrPasswordTooLong  = errors.New("password must not exceed 72 bytes")
+)
+
+const bcryptCost = 12
+
+// HashPassword generates a bcrypt hash.
 func HashPassword(password string) (string, error) {
 	if len(password) < 8 {
-		return "", errors.New("password must be at least 8 characters")
+		return "", ErrPasswordTooShort
 	}
 
-	hash, err := bcrypt.GenerateFromPassword(
+	if len(password) > 72 {
+		return "", ErrPasswordTooLong
+	}
+
+	hashedPassword, err := bcrypt.GenerateFromPassword(
 		[]byte(password),
-		bcrypt.DefaultCost,
+		bcryptCost,
 	)
+
 	if err != nil {
 		return "", err
 	}
 
-	return string(hash), nil
+	return string(hashedPassword), nil
 }
 
-// CheckPassword compares a plain-text password with its bcrypt hash.
-func CheckPassword(password string, hashedPassword string) error {
+// ComparePassword compares a plain password with its bcrypt hash.
+func ComparePassword(hashedPassword, password string) error {
+	if len(password) > 72 {
+		return ErrPasswordTooLong
+	}
+
 	return bcrypt.CompareHashAndPassword(
 		[]byte(hashedPassword),
 		[]byte(password),

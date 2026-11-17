@@ -1,24 +1,28 @@
 package router
 
 import (
-	"github.com/gin-gonic/gin"
-
 	"auth-service/internal/handler"
+
+	"github.com/gin-gonic/gin"
 )
 
 func RegisterAuthRoutes(
 	r *gin.Engine,
 	authHandler *handler.AuthHandler,
 ) {
-	auth := r.Group("/api/auth")
+	auth := r.Group("/api/v1/auth")
 
-	// Registration and email verification
-	auth.POST("/signup", authHandler.Signup)
-	auth.POST("/email/verify", authHandler.VerifyEmail)
-	auth.POST("/email/resend", authHandler.ResendOTP)
+	{
+		auth.POST("/signup", authHandler.Signup)
 
-	// Authentication
-	auth.POST("/login", authHandler.Login)
-	auth.POST("/refresh", authHandler.Refresh)
-	auth.POST("/logout", authHandler.Logout)
+		auth.POST("/verify-email", authHandler.VerifyEmail)
+
+		auth.POST("/resend-otp", authHandler.ResendOTP)
+
+		auth.POST("/login", authHandler.Login)
+
+		auth.POST("/refresh", authHandler.Refresh)
+
+		auth.POST("/logout", authHandler.Logout)
+	}
 }

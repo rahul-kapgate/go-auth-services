@@ -2,661 +2,612 @@ package repository
 
 import (
 	"context"
-	"crypto/subtle"
-	"database/sql"
 	"errors"
+	"strings"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/lib/pq"
+	"auth-service/internal/model"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 var (
-	ErrEmailExists                = errors.New("email already exists")
-	ErrInvalidRefreshToken        = errors.New("invalid refresh token")
-	ErrInvalidEmailOTP            = errors.New("invalid email OTP")
-	ErrEmailVerificationExpired   = errors.New("email verification expired")
-	ErrEmailVerificationLocked    = errors.New("maximum OTP attempts exceeded")
-	ErrEmailAlreadyVerified       = errors.New("email already verified")
-	ErrVerificationUserNotFound   = errors.New("verification user not found")
-	ErrVerificationResendCooldown = errors.New("OTP resend cooldown active")
+	ErrOTPCooldown            = errors.New("OTP resend cooldown is active")
+	ErrOTPInvalidOrExpired    = errors.New("OTP is invalid, expired, or already used")
+	ErrRefreshSessionInactive = errors.New("refresh session is inactive or expired")
+	ErrUserNotEligible        = errors.New("user does not exist or email is already verified")
 )
 
-type User struct {
-	ID            string
-	Name          string
-	Email         string
-	PasswordHash  string
-	EmailVerified bool
-}
-
 type AuthRepository struct {
-	db *sql.DB
+	client   *mongo.Client
+	users    *mongo.Collection
+	otps     *mongo.Collection
+	sessions *mongo.Collection
 }
 
-func NewAuthRepository(db *sql.DB) *AuthRepository {
-	return &AuthRepository{db: db}
+func NewAuthRepository(client *mongo.Client, db *mongo.Database) *AuthRepository {
+	return &AuthRepository{
+		client:   client,
+		users:    db.Collection("users"),
+		otps:     db.Collection("email_otps"),
+		sessions: db.Collection("refresh_sessions"),
+	}
 }
 
-// CreatePendingUserWithOTP creates an unverified user
-// and their initial verification OTP atomically.
-func (r *AuthRepository) CreatePendingUserWithOTP(
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+// =====================================================
+// USER OPERATIONS
+// =====================================================
+
+// CreateUser creates a new user.
+func (r *AuthRepository) CreateUser(
 	ctx context.Context,
-	name string,
-	email string,
-	passwordHash string,
-	codeHash []byte,
-	expiresAt time.Time,
-) (User, error) {
+	user *model.User,
+) error {
+	user.Email = normalizeEmail(user.Email)
 
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return User{}, err
-	}
-	defer tx.Rollback()
-
-	user := User{
-		ID:            uuid.NewString(),
-		Name:          name,
-		Email:         email,
-		PasswordHash:  passwordHash,
-		EmailVerified: false,
+	if user.ID.IsZero() {
+		user.ID = bson.NewObjectID()
 	}
 
-	query := `
-		INSERT INTO users (
-			id, name, email, password_hash, email_verified
-		)
-		VALUES ($1, $2, $3, $4, FALSE)
-		RETURNING id::text
-	`
-
-	err = tx.QueryRowContext(
-		ctx,
-		query,
-		user.ID,
-		user.Name,
-		user.Email,
-		user.PasswordHash,
-	).Scan(&user.ID)
-
-	if err != nil {
-		var pqErr *pq.Error
-
-		if errors.As(err, &pqErr) && pqErr.Code == "23505" {
-			return User{}, ErrEmailExists
-		}
-
-		return User{}, err
-	}
-
-	_, err = tx.ExecContext(
-		ctx,
-		`
-			INSERT INTO email_verification_otps (
-				id, user_id, code_hash, expires_at
-			)
-			VALUES ($1, $2, $3, $4)
-		`,
-		uuid.NewString(),
-		user.ID,
-		codeHash,
-		expiresAt,
-	)
-
-	if err != nil {
-		return User{}, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return User{}, err
-	}
-
-	return user, nil
+	_, err := r.users.InsertOne(ctx, user)
+	return err
 }
 
-// GetUserByEmail retrieves a user for login.
+// GetUserByEmail retrieves a user by email.
 func (r *AuthRepository) GetUserByEmail(
 	ctx context.Context,
 	email string,
-) (User, error) {
+) (*model.User, error) {
+	var user model.User
 
-	var user User
-
-	query := `
-		SELECT
-			id::text,
-			name,
-			email,
-			password_hash,
-			email_verified
-		FROM users
-		WHERE LOWER(email) = LOWER($1)
-		LIMIT 1
-	`
-
-	err := r.db.QueryRowContext(
+	err := r.users.FindOne(
 		ctx,
-		query,
-		email,
-	).Scan(
-		&user.ID,
-		&user.Name,
-		&user.Email,
-		&user.PasswordHash,
-		&user.EmailVerified,
+		bson.D{{Key: "email", Value: normalizeEmail(email)}},
+	).Decode(&user)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &user, nil
+}
+
+// GetUserByID retrieves a user by MongoDB ObjectID.
+func (r *AuthRepository) GetUserByID(
+	ctx context.Context,
+	userID bson.ObjectID,
+) (*model.User, error) {
+	var user model.User
+
+	err := r.users.FindOne(
+		ctx,
+		bson.D{{Key: "_id", Value: userID}},
+	).Decode(&user)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &user, nil
+}
+
+// MarkUserEmailVerified marks a user's email as verified.
+func (r *AuthRepository) MarkUserEmailVerified(
+	ctx context.Context,
+	userID bson.ObjectID,
+	now time.Time,
+) (bool, error) {
+	result, err := r.users.UpdateOne(
+		ctx,
+		bson.D{
+			{Key: "_id", Value: userID},
+			{Key: "is_email_verified", Value: false},
+		},
+		bson.D{
+			{
+				Key: "$set",
+				Value: bson.D{
+					{Key: "is_email_verified", Value: true},
+					{Key: "email_verified_at", Value: now},
+					{Key: "updated_at", Value: now},
+				},
+			},
+		},
 	)
 
 	if err != nil {
-		return User{}, err
+		return false, err
 	}
 
-	return user, nil
+	return result.ModifiedCount == 1, nil
 }
 
-// IssueEmailVerificationOTP invalidates the previous OTP
-// and stores a new OTP after checking the resend cooldown.
-func (r *AuthRepository) IssueEmailVerificationOTP(
+// =====================================================
+// EMAIL OTP OPERATIONS
+// =====================================================
+
+// FindEmailOTP retrieves an OTP by email and purpose.
+func (r *AuthRepository) FindEmailOTP(
 	ctx context.Context,
 	email string,
-	codeHash []byte,
-	expiresAt time.Time,
-	cooldown time.Duration,
-) (User, error) {
+	purpose string,
+) (*model.EmailOTP, error) {
+	var otp model.EmailOTP
 
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return User{}, err
-	}
-	defer tx.Rollback()
-
-	var user User
-
-	err = tx.QueryRowContext(
+	err := r.otps.FindOne(
 		ctx,
-		`
-			SELECT id::text, name, email, password_hash, email_verified
-			FROM users
-			WHERE LOWER(email) = LOWER($1)
-			FOR UPDATE
-		`,
-		email,
-	).Scan(
-		&user.ID,
-		&user.Name,
-		&user.Email,
-		&user.PasswordHash,
-		&user.EmailVerified,
-	)
-
-	if errors.Is(err, sql.ErrNoRows) {
-		return User{}, ErrVerificationUserNotFound
-	}
+		bson.D{
+			{Key: "email", Value: normalizeEmail(email)},
+			{Key: "purpose", Value: purpose},
+		},
+	).Decode(&otp)
 
 	if err != nil {
-		return User{}, err
+		return nil, err
 	}
 
-	if user.EmailVerified {
-		return User{}, ErrEmailAlreadyVerified
-	}
-
-	var lastCreated time.Time
-
-	err = tx.QueryRowContext(
-		ctx,
-		`
-			SELECT created_at
-			FROM email_verification_otps
-			WHERE user_id = $1
-			ORDER BY created_at DESC
-			LIMIT 1
-		`,
-		user.ID,
-	).Scan(&lastCreated)
-
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return User{}, err
-	}
-
-	if err == nil && time.Now().Before(lastCreated.Add(cooldown)) {
-		return User{}, ErrVerificationResendCooldown
-	}
-
-	_, err = tx.ExecContext(
-		ctx,
-		`
-			UPDATE email_verification_otps
-			SET consumed_at = NOW()
-			WHERE user_id = $1
-			  AND consumed_at IS NULL
-		`,
-		user.ID,
-	)
-
-	if err != nil {
-		return User{}, err
-	}
-
-	_, err = tx.ExecContext(
-		ctx,
-		`
-			INSERT INTO email_verification_otps (
-				id, user_id, code_hash, expires_at
-			)
-			VALUES ($1, $2, $3, $4)
-		`,
-		uuid.NewString(),
-		user.ID,
-		codeHash,
-		expiresAt,
-	)
-
-	if err != nil {
-		return User{}, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return User{}, err
-	}
-
-	return user, nil
+	return &otp, nil
 }
 
-// VerifyEmailOTP checks the OTP and marks the user as verified.
-// Both operations happen inside one transaction.
-func (r *AuthRepository) VerifyEmailOTP(
+// SaveEmailOTP inserts a new OTP or updates an existing OTP
+// after the resend cooldown has elapsed.
+func (r *AuthRepository) SaveEmailOTP(
 	ctx context.Context,
-	email string,
-	submittedHash []byte,
-	maxAttempts int,
-) (User, error) {
+	otp *model.EmailOTP,
+) error {
+	otp.Email = normalizeEmail(otp.Email)
 
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return User{}, err
+	if otp.ID.IsZero() {
+		otp.ID = bson.NewObjectID()
 	}
-	defer tx.Rollback()
 
-	var user User
+	filter := bson.D{
+		{Key: "email", Value: otp.Email},
+		{Key: "purpose", Value: otp.Purpose},
+	}
 
-	err = tx.QueryRowContext(
-		ctx,
-		`
-			SELECT id::text, name, email, password_hash, email_verified
-			FROM users
-			WHERE LOWER(email) = LOWER($1)
-			FOR UPDATE
-		`,
-		email,
-	).Scan(
-		&user.ID,
-		&user.Name,
-		&user.Email,
-		&user.PasswordHash,
-		&user.EmailVerified,
-	)
+	var existing model.EmailOTP
 
-	if errors.Is(err, sql.ErrNoRows) {
-		return User{}, ErrInvalidEmailOTP
+	err := r.otps.FindOne(ctx, filter).Decode(&existing)
+
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		_, err = r.otps.InsertOne(ctx, otp)
+
+		if mongo.IsDuplicateKeyError(err) {
+			return r.updateExistingOTP(ctx, otp)
+		}
+
+		return err
 	}
 
 	if err != nil {
-		return User{}, err
+		return err
 	}
 
-	if user.EmailVerified {
-		return User{}, ErrEmailAlreadyVerified
+	if otp.CreatedAt.Before(existing.ResendAvailableAt) {
+		return ErrOTPCooldown
 	}
 
-	var (
-		otpID      string
-		storedHash []byte
-		expiresAt  time.Time
-		attempts   int
-		consumedAt sql.NullTime
-	)
-
-	err = tx.QueryRowContext(
-		ctx,
-		`
-			SELECT id::text, code_hash, expires_at, attempts, consumed_at
-			FROM email_verification_otps
-			WHERE user_id = $1
-			ORDER BY created_at DESC
-			LIMIT 1
-			FOR UPDATE
-		`,
-		user.ID,
-	).Scan(
-		&otpID,
-		&storedHash,
-		&expiresAt,
-		&attempts,
-		&consumedAt,
-	)
-
-	if errors.Is(err, sql.ErrNoRows) {
-		return User{}, ErrInvalidEmailOTP
-	}
-
-	if err != nil {
-		return User{}, err
-	}
-
-	if consumedAt.Valid {
-		return User{}, ErrInvalidEmailOTP
-	}
-
-	if attempts >= maxAttempts {
-		return User{}, ErrEmailVerificationLocked
-	}
-
-	if !expiresAt.After(time.Now()) {
-		_, err = tx.ExecContext(
-			ctx,
-			`UPDATE email_verification_otps
-			 SET consumed_at = NOW()
-			 WHERE id = $1`,
-			otpID,
-		)
-
-		if err != nil {
-			return User{}, err
-		}
-
-		if err := tx.Commit(); err != nil {
-			return User{}, err
-		}
-
-		return User{}, ErrEmailVerificationExpired
-	}
-
-	if subtle.ConstantTimeCompare(storedHash, submittedHash) != 1 {
-		nextAttempts := attempts + 1
-
-		_, err = tx.ExecContext(
-			ctx,
-			`
-				UPDATE email_verification_otps
-				SET attempts = $1,
-				    consumed_at = CASE
-				        WHEN $1 >= $2 THEN NOW()
-				        ELSE consumed_at
-				    END
-				WHERE id = $3
-			`,
-			nextAttempts,
-			maxAttempts,
-			otpID,
-		)
-
-		if err != nil {
-			return User{}, err
-		}
-
-		if err := tx.Commit(); err != nil {
-			return User{}, err
-		}
-
-		if nextAttempts >= maxAttempts {
-			return User{}, ErrEmailVerificationLocked
-		}
-
-		return User{}, ErrInvalidEmailOTP
-	}
-
-	_, err = tx.ExecContext(
-		ctx,
-		`
-			UPDATE email_verification_otps
-			SET consumed_at = NOW()
-			WHERE id = $1
-		`,
-		otpID,
-	)
-
-	if err != nil {
-		return User{}, err
-	}
-
-	_, err = tx.ExecContext(
-		ctx,
-		`
-			UPDATE users
-			SET email_verified = TRUE,
-			    updated_at = NOW()
-			WHERE id = $1
-		`,
-		user.ID,
-	)
-
-	if err != nil {
-		return User{}, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return User{}, err
-	}
-
-	user.EmailVerified = true
-
-	return user, nil
+	return r.updateExistingOTP(ctx, otp)
 }
 
-// CreateRefreshSession stores a hashed refresh token.
+// updateExistingOTP updates an OTP only when its resend cooldown has elapsed.
+func (r *AuthRepository) updateExistingOTP(
+	ctx context.Context,
+	otp *model.EmailOTP,
+) error {
+	result, err := r.otps.UpdateOne(
+		ctx,
+		bson.D{
+			{Key: "email", Value: otp.Email},
+			{Key: "purpose", Value: otp.Purpose},
+			{
+				Key: "resend_available_at",
+				Value: bson.D{
+					{Key: "$lte", Value: otp.CreatedAt},
+				},
+			},
+		},
+		bson.D{
+			{
+				Key: "$set",
+				Value: bson.D{
+					{Key: "user_id", Value: otp.UserID},
+					{Key: "otp_hash", Value: otp.OTPHash},
+					{Key: "attempts", Value: 0},
+					{Key: "max_attempts", Value: otp.MaxAttempts},
+					{Key: "expires_at", Value: otp.ExpiresAt},
+					{Key: "resend_available_at", Value: otp.ResendAvailableAt},
+					{Key: "created_at", Value: otp.CreatedAt},
+					{Key: "updated_at", Value: otp.UpdatedAt},
+				},
+			},
+		},
+	)
+
+	if err != nil {
+		return err
+	}
+
+	if result.ModifiedCount == 0 {
+		return ErrOTPCooldown
+	}
+
+	return nil
+}
+
+// IncrementOTPAttempts increments the failed verification attempts.
+// It never increments beyond the configured maximum.
+func (r *AuthRepository) IncrementOTPAttempts(
+	ctx context.Context,
+	otpID bson.ObjectID,
+	now time.Time,
+) (bool, error) {
+	filter := bson.D{
+		{Key: "_id", Value: otpID},
+		{
+			Key: "expires_at",
+			Value: bson.D{
+				{Key: "$gt", Value: now},
+			},
+		},
+		{
+			Key: "$expr",
+			Value: bson.D{
+				{
+					Key: "$lt",
+					Value: bson.A{
+						"$attempts",
+						"$max_attempts",
+					},
+				},
+			},
+		},
+	}
+
+	result, err := r.otps.UpdateOne(
+		ctx,
+		filter,
+		bson.D{
+			{
+				Key: "$inc",
+				Value: bson.D{
+					{Key: "attempts", Value: 1},
+				},
+			},
+			{
+				Key: "$set",
+				Value: bson.D{
+					{Key: "updated_at", Value: now},
+				},
+			},
+		},
+	)
+
+	if err != nil {
+		return false, err
+	}
+
+	return result.ModifiedCount == 1, nil
+}
+
+// ConsumeEmailOTP atomically deletes an OTP after successful verification.
+// This ensures an OTP cannot be successfully reused.
+func (r *AuthRepository) ConsumeEmailOTP(
+	ctx context.Context,
+	otpID bson.ObjectID,
+	otpHash string,
+	now time.Time,
+) (bool, error) {
+	result, err := r.otps.DeleteOne(
+		ctx,
+		bson.D{
+			{Key: "_id", Value: otpID},
+			{Key: "otp_hash", Value: otpHash},
+			{
+				Key: "expires_at",
+				Value: bson.D{
+					{Key: "$gt", Value: now},
+				},
+			},
+			{
+				Key: "$expr",
+				Value: bson.D{
+					{
+						Key: "$lt",
+						Value: bson.A{
+							"$attempts",
+							"$max_attempts",
+						},
+					},
+				},
+			},
+		},
+	)
+
+	if err != nil {
+		return false, err
+	}
+
+	if result.DeletedCount != 1 {
+		return false, ErrOTPInvalidOrExpired
+	}
+
+	return true, nil
+}
+
+// =====================================================
+// REFRESH TOKEN OPERATIONS
+// =====================================================
+
+// CreateRefreshSession stores a new refresh-token session.
 func (r *AuthRepository) CreateRefreshSession(
 	ctx context.Context,
-	userID string,
-	familyID string,
-	tokenHash []byte,
-	expiresAt time.Time,
+	session *model.RefreshSession,
 ) error {
+	if session.ID.IsZero() {
+		session.ID = bson.NewObjectID()
+	}
 
-	_, err := r.db.ExecContext(
+	if session.FamilyID.IsZero() {
+		session.FamilyID = bson.NewObjectID()
+	}
+
+	_, err := r.sessions.InsertOne(ctx, session)
+	return err
+}
+
+// FindRefreshSessionByHash retrieves a refresh session.
+func (r *AuthRepository) FindRefreshSessionByHash(
+	ctx context.Context,
+	tokenHash string,
+) (*model.RefreshSession, error) {
+	var session model.RefreshSession
+
+	err := r.sessions.FindOne(
 		ctx,
-		`
-			INSERT INTO auth_refresh_tokens (
-				id, user_id, family_id, token_hash, expires_at
+		bson.D{{Key: "token_hash", Value: tokenHash}},
+	).Decode(&session)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &session, nil
+}
+
+// RotateRefreshSession atomically revokes an old token and stores
+// its replacement within a MongoDB transaction.
+func (r *AuthRepository) RotateRefreshSession(
+	ctx context.Context,
+	oldTokenHash string,
+	newSession *model.RefreshSession,
+	now time.Time,
+) error {
+	if newSession.ID.IsZero() {
+		newSession.ID = bson.NewObjectID()
+	}
+
+	session, err := r.client.StartSession()
+	if err != nil {
+		return err
+	}
+	defer session.EndSession(ctx)
+
+	_, err = session.WithTransaction(
+		ctx,
+		func(txCtx context.Context) (interface{}, error) {
+
+			// Revoke the existing token only if it is still active.
+			result, err := r.sessions.UpdateOne(
+				txCtx,
+				bson.D{
+					{Key: "token_hash", Value: oldTokenHash},
+					{
+						Key: "revoked_at",
+						Value: bson.D{
+							{Key: "$exists", Value: false},
+						},
+					},
+					{
+						Key: "expires_at",
+						Value: bson.D{
+							{Key: "$gt", Value: now},
+						},
+					},
+				},
+				bson.D{
+					{
+						Key: "$set",
+						Value: bson.D{
+							{Key: "revoked_at", Value: now},
+							{Key: "revoked_reason", Value: "rotated"},
+							{Key: "replaced_by_token_hash", Value: newSession.TokenHash},
+							{Key: "last_used_at", Value: now},
+						},
+					},
+				},
 			)
-			VALUES ($1, $2, $3, $4, $5)
-		`,
-		uuid.NewString(),
-		userID,
-		familyID,
-		tokenHash,
-		expiresAt,
+
+			if err != nil {
+				return nil, err
+			}
+
+			if result.ModifiedCount != 1 {
+				return nil, ErrRefreshSessionInactive
+			}
+
+			// Insert the replacement token in the same transaction.
+			_, err = r.sessions.InsertOne(txCtx, newSession)
+			if err != nil {
+				return nil, err
+			}
+
+			return nil, nil
+		},
 	)
 
 	return err
 }
 
-// RotateRefreshToken atomically replaces the old token.
-func (r *AuthRepository) RotateRefreshToken(
+// RevokeRefreshSession revokes one active refresh session.
+func (r *AuthRepository) RevokeRefreshSession(
 	ctx context.Context,
-	oldHash []byte,
-	newHash []byte,
-	newExpiry time.Time,
-) (User, error) {
-
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return User{}, err
-	}
-	defer tx.Rollback()
-
-	var (
-		sessionID string
-		userID    string
-		familyID  string
-		expiresAt time.Time
-		revokedAt sql.NullTime
-	)
-
-	err = tx.QueryRowContext(
+	tokenHash string,
+	now time.Time,
+	reason string,
+) (bool, error) {
+	result, err := r.sessions.UpdateOne(
 		ctx,
-		`
-			SELECT id::text, user_id::text, family_id::text,
-			       expires_at, revoked_at
-			FROM auth_refresh_tokens
-			WHERE token_hash = $1
-			FOR UPDATE
-		`,
-		oldHash,
-	).Scan(
-		&sessionID,
-		&userID,
-		&familyID,
-		&expiresAt,
-		&revokedAt,
-	)
-
-	if errors.Is(err, sql.ErrNoRows) {
-		return User{}, ErrInvalidRefreshToken
-	}
-
-	if err != nil {
-		return User{}, err
-	}
-
-	// Reuse detection: revoke the complete session family.
-	if revokedAt.Valid {
-		_, err = tx.ExecContext(
-			ctx,
-			`
-				UPDATE auth_refresh_tokens
-				SET revoked_at = NOW()
-				WHERE family_id = $1
-				  AND revoked_at IS NULL
-			`,
-			familyID,
-		)
-
-		if err != nil {
-			return User{}, err
-		}
-
-		if err := tx.Commit(); err != nil {
-			return User{}, err
-		}
-
-		return User{}, ErrInvalidRefreshToken
-	}
-
-	if !expiresAt.After(time.Now()) {
-		_, err = tx.ExecContext(
-			ctx,
-			`
-				UPDATE auth_refresh_tokens
-				SET revoked_at = NOW()
-				WHERE id = $1
-			`,
-			sessionID,
-		)
-
-		if err != nil {
-			return User{}, err
-		}
-
-		if err := tx.Commit(); err != nil {
-			return User{}, err
-		}
-
-		return User{}, ErrInvalidRefreshToken
-	}
-
-	var user User
-
-	err = tx.QueryRowContext(
-		ctx,
-		`
-			SELECT id::text, name, email, password_hash, email_verified
-			FROM users
-			WHERE id = $1
-		`,
-		userID,
-	).Scan(
-		&user.ID,
-		&user.Name,
-		&user.Email,
-		&user.PasswordHash,
-		&user.EmailVerified,
+		bson.D{
+			{Key: "token_hash", Value: tokenHash},
+			{
+				Key: "revoked_at",
+				Value: bson.D{
+					{Key: "$exists", Value: false},
+				},
+			},
+		},
+		bson.D{
+			{
+				Key: "$set",
+				Value: bson.D{
+					{Key: "revoked_at", Value: now},
+					{Key: "revoked_reason", Value: reason},
+				},
+			},
+		},
 	)
 
 	if err != nil {
-		return User{}, err
+		return false, err
 	}
 
-	_, err = tx.ExecContext(
-		ctx,
-		`
-			UPDATE auth_refresh_tokens
-			SET revoked_at = NOW(),
-			    replaced_by_token_hash = $1
-			WHERE id = $2
-		`,
-		newHash,
-		sessionID,
-	)
-
-	if err != nil {
-		return User{}, err
-	}
-
-	_, err = tx.ExecContext(
-		ctx,
-		`
-			INSERT INTO auth_refresh_tokens (
-				id, user_id, family_id, token_hash, expires_at
-			)
-			VALUES ($1, $2, $3, $4, $5)
-		`,
-		uuid.NewString(),
-		user.ID,
-		familyID,
-		newHash,
-		newExpiry,
-	)
-
-	if err != nil {
-		return User{}, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return User{}, err
-	}
-
-	return user, nil
+	return result.ModifiedCount == 1, nil
 }
 
-// RevokeRefreshToken logs out the current session.
-func (r *AuthRepository) RevokeRefreshToken(
+// RevokeTokenFamily revokes every active refresh token
+// belonging to the same token family.
+func (r *AuthRepository) RevokeTokenFamily(
 	ctx context.Context,
-	tokenHash []byte,
+	familyID bson.ObjectID,
+	now time.Time,
+	reason string,
 ) error {
-
-	result, err := r.db.ExecContext(
+	_, err := r.sessions.UpdateMany(
 		ctx,
-		`
-			UPDATE auth_refresh_tokens
-			SET revoked_at = COALESCE(revoked_at, NOW())
-			WHERE token_hash = $1
-		`,
-		tokenHash,
+		bson.D{
+			{Key: "family_id", Value: familyID},
+			{
+				Key: "revoked_at",
+				Value: bson.D{
+					{Key: "$exists", Value: false},
+				},
+			},
+		},
+		bson.D{
+			{
+				Key: "$set",
+				Value: bson.D{
+					{Key: "revoked_at", Value: now},
+					{Key: "revoked_reason", Value: reason},
+				},
+			},
+		},
 	)
 
+	return err
+}
+
+func (r *AuthRepository) ConsumeOTPAndVerifyUser(
+	ctx context.Context,
+	userID bson.ObjectID,
+	otpID bson.ObjectID,
+	otpHash string,
+	now time.Time,
+) error {
+
+	session, err := r.client.StartSession()
 	if err != nil {
 		return err
 	}
+	defer session.EndSession(ctx)
 
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
+	_, err = session.WithTransaction(
+		ctx,
+		func(txCtx context.Context) (interface{}, error) {
 
-	if rows == 0 {
-		return ErrInvalidRefreshToken
-	}
+			// 1. Delete OTP only if it is valid.
+			result, err := r.otps.DeleteOne(
+				txCtx,
+				bson.D{
+					{Key: "_id", Value: otpID},
+					{Key: "user_id", Value: userID},
+					{Key: "otp_hash", Value: otpHash},
+					{
+						Key: "expires_at",
+						Value: bson.D{
+							{Key: "$gt", Value: now},
+						},
+					},
+					{
+						Key: "$expr",
+						Value: bson.D{
+							{
+								Key: "$lt",
+								Value: bson.A{
+									"$attempts",
+									"$max_attempts",
+								},
+							},
+						},
+					},
+				},
+			)
 
-	return nil
+			if err != nil {
+				return nil, err
+			}
+
+			if result.DeletedCount != 1 {
+				return nil, ErrOTPInvalidOrExpired
+			}
+
+			// 2. Mark user as verified.
+			updateResult, err := r.users.UpdateOne(
+				txCtx,
+				bson.D{
+					{Key: "_id", Value: userID},
+					{Key: "is_email_verified", Value: false},
+				},
+				bson.D{
+					{
+						Key: "$set",
+						Value: bson.D{
+							{Key: "is_email_verified", Value: true},
+							{Key: "email_verified_at", Value: now},
+							{Key: "updated_at", Value: now},
+						},
+					},
+				},
+			)
+
+			if err != nil {
+				return nil, err
+			}
+
+			if updateResult.ModifiedCount != 1 {
+				return nil, ErrUserNotEligible
+			}
+
+			return nil, nil
+		},
+	)
+
+	return err
 }
